@@ -8,7 +8,8 @@ use smallvec::SmallVec;
 
 use super::{sync::Outboard, EncodeError, Leaf, Parent};
 use crate::{
-    iter::BaoChunk, rec::truncate_ranges, split_inner, ChunkNum, ChunkRangesRef, HashMode, TreeNode,
+    iter::BaoChunk, rec::truncate_ranges, split_inner, BlockSize, ChunkNum, ChunkRangesRef,
+    HashMode, TreeNode,
 };
 
 /// A content item for the bao streaming protocol.
@@ -122,9 +123,6 @@ where
 {
     send.send(EncodedItem::Size(outboard.tree().size())).await?;
     let res: result::Result<std::result::Result<(), F::Error>, EncodeError> = async {
-        if ranges.is_empty() {
-            return Ok(Ok(()));
-        }
         let mut stack: SmallVec<[_; 10]> = SmallVec::<[blake3::Hash; 10]>::new();
         stack.push(outboard.root());
         let data = data;
@@ -140,7 +138,9 @@ where
                     node,
                     ..
                 } => {
-                    let (l_hash, r_hash) = outboard.load(node)?.unwrap();
+                    let (l_hash, r_hash) = outboard
+                        .load(node)?
+                        .ok_or_else(|| EncodeError::missing_hash_pair(node))?;
                     let actual = mode.parent_cv(&l_hash, &r_hash, is_root);
                     let expected = stack.pop().unwrap();
                     if actual != expected {
@@ -323,10 +323,11 @@ fn traverse_selected_rec_impl(
         // todo: maybe call into blake3::hazmat::hash_subtree directly for this case? it would be faster.
         let full = query.is_all();
         let emit_parent = !query.is_empty() && (!full || level >= min_level);
+        let node = TreeNode::from_start_chunk_and_level(start_chunk, BlockSize(level as u8));
         let hash_offset = if emit_parent {
             // make some room for the hash pair
             let pair = Parent {
-                node: TreeNode(0),
+                node,
                 pair: ([0; 32].into(), [0; 32].into()),
             };
             res.push(pair.into());
@@ -357,8 +358,6 @@ fn traverse_selected_rec_impl(
         );
         // backfill the hashes if needed
         if let Some(o) = hash_offset {
-            // todo: figure out how to get the tree node from the start chunk!
-            let node = TreeNode(0);
             res[o] = Parent {
                 node,
                 pair: (left, right),
@@ -371,83 +370,47 @@ fn traverse_selected_rec_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{
-        io::{
-            outboard::PreOrderMemOutboard,
-            sync::{encode_ranges_validated, keyed_encode_ranges_validated},
-        },
-        BlockSize, ChunkRanges,
-    };
+    use std::io;
 
-    fn flatten(items: Vec<EncodedItem>) -> Vec<u8> {
-        let mut res = Vec::new();
-        for item in items {
-            match item {
-                EncodedItem::Leaf(Leaf { data, .. }) => res.extend_from_slice(&data),
-                EncodedItem::Parent(Parent { pair: (l, r), .. }) => {
-                    res.extend_from_slice(l.as_bytes());
-                    res.extend_from_slice(r.as_bytes());
-                }
-                _ => {}
+    use super::*;
+    use crate::{io::outboard::PreOrderMemOutboard, BaoTree, BlockSize, ChunkRanges};
+
+    struct NoneOutboard(PreOrderMemOutboard);
+
+    impl Outboard for NoneOutboard {
+        fn root(&self) -> blake3::Hash {
+            self.0.root
+        }
+        fn tree(&self) -> BaoTree {
+            self.0.tree
+        }
+        fn load(&self, node: TreeNode) -> io::Result<Option<(blake3::Hash, blake3::Hash)>> {
+            if node.level() == 0 {
+                Ok(None)
+            } else {
+                self.0.load(node)
             }
         }
-        res
     }
 
     #[tokio::test]
-    async fn smoke() {
+    async fn outboard_none() {
         let data = [0u8; 100000];
-        let outboard = PreOrderMemOutboard::create(data, BlockSize::from_chunk_log(4));
+        let outboard = NoneOutboard(PreOrderMemOutboard::create(data, BlockSize::ZERO));
         let (mut tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let mut encoded = Vec::new();
-        encode_ranges_validated(&data[..], &outboard, &ChunkRanges::empty(), &mut encoded).unwrap();
         tokio::spawn(async move {
-            traverse_ranges_validated(&data[..], &outboard, &ChunkRanges::empty(), &mut tx)
+            traverse_ranges_validated(&data[..], &outboard, &ChunkRanges::all(), &mut tx)
                 .await
                 .unwrap();
         });
-        let mut res = Vec::new();
+        let mut last = None;
         while let Some(item) = rx.recv().await {
-            res.push(item);
+            last = Some(item);
         }
-        println!("{res:?}");
-        let encoded2 = flatten(res);
-        assert_eq!(encoded, encoded2);
-    }
-
-    #[tokio::test]
-    async fn keyed_smoke() {
-        let data = [0u8; 100000];
-        let key = blake3::derive_key("bao-tree.test", b"mixed");
-        let outboard = PreOrderMemOutboard::create_keyed(data, BlockSize::from_chunk_log(4), &key);
-        let (mut tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let mut encoded = Vec::new();
-        keyed_encode_ranges_validated(
-            &data[..],
-            &outboard,
-            &ChunkRanges::all(),
-            &mut encoded,
-            &key,
-        )
-        .unwrap();
-        tokio::spawn(async move {
-            keyed_traverse_ranges_validated(
-                &data[..],
-                &outboard,
-                &ChunkRanges::all(),
-                &mut tx,
-                &key,
-            )
-            .await
-            .unwrap();
-        });
-        let mut res = Vec::new();
-        while let Some(item) = rx.recv().await {
-            res.push(item);
-        }
-        let encoded2 = flatten(res);
-        assert_eq!(encoded, encoded2);
+        assert!(matches!(
+            last,
+            Some(EncodedItem::Error(EncodeError::Io(e))) if e.kind() == io::ErrorKind::InvalidData
+        ));
     }
 }
 

@@ -14,7 +14,6 @@ use std::{
     result,
 };
 
-use bytes::Bytes;
 pub use iroh_io::{AsyncSliceReader, AsyncSliceWriter};
 use iroh_io::{AsyncStreamReader, AsyncStreamWriter};
 use smallvec::SmallVec;
@@ -25,7 +24,7 @@ use crate::{
     blake3,
     io::{
         error::EncodeError,
-        outboard::{PostOrderOutboard, PreOrderOutboard},
+        outboard::{parse_hash_pair, PostOrderOutboard, PreOrderOutboard},
         Leaf, Parent,
     },
     iter::{BaoChunk, ResponseIter},
@@ -64,6 +63,17 @@ pub trait Outboard {
     fn tree(&self) -> BaoTree;
     /// load the hash pair for a node
     ///
+    /// Return `Ok(None)` only for nodes that are not stored in this outboard by
+    /// design. Usually these are the nodes inside a chunk group, where
+    /// [BaoTree::pre_order_offset] or [BaoTree::post_order_offset] return `None`,
+    /// but an outboard may also store some of them, e.g. to be able to serve
+    /// parts of a chunk group.
+    ///
+    /// For a node whose hash pair is not available yet, such as an unwritten
+    /// region of a sparse file, return a pair of zero hashes. These never
+    /// verify, so the node is treated like corrupted data. Return an error only
+    /// for io failures.
+    ///
     /// This takes a &mut self not because it mutates the outboard (it doesn't),
     /// but to ensure that there is only one outstanding load at a time.
     fn load(
@@ -82,6 +92,9 @@ pub trait Outboard {
 /// implementation [super::outboard::EmptyOutboard].
 pub trait OutboardMut: Sized {
     /// Save a hash pair for a node
+    ///
+    /// Nodes that are not stored in this outboard by design, i.e. where
+    /// [Outboard::load] returns `Ok(None)`, must be accepted and ignored.
     fn save(
         &mut self,
         node: TreeNode,
@@ -126,7 +139,7 @@ pub trait CreateOutboard {
     /// So this can be used to initialize an outboard that does not have a default,
     /// such as a file based one.
     ///
-    /// It will only include data up the the current tree size.
+    /// It will only include data up to the current tree size.
     fn init_from(&mut self, data: impl AsyncStreamReader) -> impl Future<Output = io::Result<()>>;
 }
 
@@ -159,11 +172,7 @@ impl<R: AsyncSliceReader> Outboard for PreOrderOutboard<R> {
         };
         let offset = offset * 64;
         let content = self.data.read_at(offset, 64).await?;
-        Ok(Some(if content.len() != 64 {
-            (blake3::Hash::from([0; 32]), blake3::Hash::from([0; 32]))
-        } else {
-            parse_hash_pair(content)?
-        }))
+        Ok(Some(hash_pair(&content)))
     }
 }
 
@@ -292,29 +301,20 @@ impl<R: AsyncSliceReader> Outboard for PostOrderOutboard<R> {
         };
         let offset = offset.value() * 64;
         let content = self.data.read_at(offset, 64).await?;
-        Ok(Some(if content.len() != 64 {
-            (blake3::Hash::from([0; 32]), blake3::Hash::from([0; 32]))
-        } else {
-            parse_hash_pair(content)?
-        }))
+        Ok(Some(hash_pair(&content)))
     }
 }
 
-pub(crate) fn parse_hash_pair(buf: Bytes) -> io::Result<(blake3::Hash, blake3::Hash)> {
-    if buf.len() != 64 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "hash pair must be 64 bytes",
-        ));
-    }
-    let l_hash = blake3::Hash::from(<[u8; 32]>::try_from(&buf[..32]).unwrap());
-    let r_hash = blake3::Hash::from(<[u8; 32]>::try_from(&buf[32..]).unwrap());
-    Ok((l_hash, r_hash))
+/// The hash pair in `content`, or zero hashes if the data ended before the
+/// pair, like an unwritten region of a sparse file.
+fn hash_pair(content: &[u8]) -> (blake3::Hash, blake3::Hash) {
+    parse_hash_pair(content.try_into().unwrap_or([0u8; 64]))
 }
 
 #[derive(Debug)]
 struct ResponseDecoderInner<R> {
     iter: ResponseIter,
+    hash: blake3::Hash,
     stack: SmallVec<[blake3::Hash; 10]>,
     encoded: R,
     mode: HashMode,
@@ -332,6 +332,7 @@ impl<R> ResponseDecoderInner<R> {
         let ranges = truncate_ranges_owned(ranges, tree.size());
         let mut res = Self {
             iter: ResponseIter::new(tree, ranges),
+            hash,
             stack: SmallVec::new(),
             encoded,
             mode,
@@ -342,6 +343,9 @@ impl<R> ResponseDecoderInner<R> {
 }
 
 /// Response decoder.
+///
+/// After an item with an error, the next call to [Self::next] returns
+/// [ResponseDecoderNext::Done].
 ///
 /// Keyed callers should use [Self::new_keyed].
 #[derive(Debug)]
@@ -405,8 +409,14 @@ impl<R: AsyncStreamReader> ResponseDecoder<R> {
 
     /// Proceed to the next state by reading the next chunk from the stream.
     pub async fn next(mut self) -> ResponseDecoderNext<R> {
+        if self.0.stack.is_empty() {
+            return ResponseDecoderNext::Done(self.0.encoded);
+        }
         if let Some(chunk) = self.0.iter.next() {
             let item = self.next0(chunk).await;
+            if item.is_err() {
+                self.0.stack.clear();
+            }
             ResponseDecoderNext::More((self, item))
         } else {
             ResponseDecoderNext::Done(self.0.encoded)
@@ -425,7 +435,7 @@ impl<R: AsyncStreamReader> ResponseDecoder<R> {
 
     /// Hash of the blob we are currently getting
     pub fn hash(&self) -> &blake3::Hash {
-        &self.0.stack[0]
+        &self.0.hash
     }
 
     async fn next0(&mut self, chunk: BaoChunk) -> std::result::Result<BaoContentItem, DecodeError> {
@@ -455,7 +465,6 @@ impl<R: AsyncStreamReader> ResponseDecoder<R> {
                 if left {
                     this.stack.push(l_hash);
                 }
-                // Validate after pushing the children so that we could in principle continue
                 if parent_hash != actual {
                     return Err(DecodeError::ParentHashMismatch(node));
                 }
@@ -548,7 +557,10 @@ where
     for item in tree.ranges_pre_order_chunks_iter_ref(ranges, 0) {
         match item {
             BaoChunk::Parent { node, .. } => {
-                let (l_hash, r_hash) = outboard.load(node).await?.unwrap();
+                let (l_hash, r_hash) = outboard
+                    .load(node)
+                    .await?
+                    .ok_or_else(|| EncodeError::missing_hash_pair(node))?;
                 let pair = combine_hash_pair(&l_hash, &r_hash);
                 encoded
                     .write(&pair)
@@ -655,7 +667,10 @@ where
                 node,
                 ..
             } => {
-                let (l_hash, r_hash) = outboard.load(node).await?.unwrap();
+                let (l_hash, r_hash) = outboard
+                    .load(node)
+                    .await?
+                    .ok_or_else(|| EncodeError::missing_hash_pair(node))?;
                 let actual = mode.parent_cv(&l_hash, &r_hash, is_root);
                 let expected = stack.pop().unwrap();
                 if actual != expected {
@@ -1027,13 +1042,18 @@ mod validate {
             co: &Co<io::Result<Range<ChunkNum>>>,
             mode: HashMode,
         ) -> io::Result<()> {
+            if ranges.is_empty() {
+                return Ok(());
+            }
             let tree = outboard.tree();
             if tree.blocks() == 1 {
                 // special case for a tree that fits in one block / chunk group
                 let mut data = data;
-                let data = data
-                    .read_exact_at(0, tree.size().try_into().unwrap())
-                    .await?;
+                let data = match data.read_exact_at(0, tree.size().try_into().unwrap()).await {
+                    Ok(data) => data,
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                    Err(e) => return Err(e),
+                };
                 let actual = mode.hash_subtree(0, &data, true);
                 if actual == outboard.root() {
                     co.yield_(Ok(ChunkNum(0)..tree.chunks())).await;
@@ -1063,7 +1083,11 @@ mod validate {
             is_root: bool,
         ) -> io::Result<()> {
             let len = (range.end - range.start).try_into().unwrap();
-            let data = self.data.read_exact_at(range.start, len).await?;
+            let data = match self.data.read_exact_at(range.start, len).await {
+                Ok(data) => data,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e),
+            };
             // is_root is always false because the case of a single chunk group is handled before calling this function
             let actual =
                 self.mode
@@ -1098,7 +1122,7 @@ mod validate {
                     return Ok(());
                 }
                 let Some((l_hash, r_hash)) = self.outboard.load(node).await? else {
-                    // outboard is incomplete, we can't validate
+                    // node is not stored in the outboard, we can't validate
                     return Ok(());
                 };
                 let actual = self.mode.parent_cv(&l_hash, &r_hash, is_root);
@@ -1186,6 +1210,9 @@ mod validate {
             co: &Co<io::Result<Range<ChunkNum>>>,
             mode: HashMode,
         ) -> io::Result<()> {
+            if ranges.is_empty() {
+                return Ok(());
+            }
             let tree = outboard.tree();
             if tree.blocks() == 1 {
                 // special case for a tree that fits in one block / chunk group
@@ -1231,7 +1258,7 @@ mod validate {
                     return Ok(());
                 }
                 let Some((l_hash, r_hash)) = self.outboard.load(node).await? else {
-                    // outboard is incomplete, we can't validate
+                    // node is not stored in the outboard, we can't validate
                     return Ok(());
                 };
                 let actual = self.mode.parent_cv(&l_hash, &r_hash, is_root);

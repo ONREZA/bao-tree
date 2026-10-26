@@ -17,7 +17,7 @@
 //! and [BlockSize] is the log base 2 of the chunk group size.
 //!
 //! All this is then used in the [io] module to implement the actual io, both
-//! [synchronous](io::sync) and [asynchronous](io::tokio).
+//! [synchronous](io::sync) and [asynchronous](io::fsm).
 //!
 //! # Basic usage
 //!
@@ -130,7 +130,7 @@
 //!
 //! The async version is very similar to the sync version, except that it needs
 //! an async context. All functions that do IO are async. The file has to be
-//! an [iroh_io::File], which is just a wrapper for [std::fs::File] that implements
+//! an `iroh_io::File`, which is just a wrapper for [std::fs::File] that implements
 //! async random access via the [AsyncSliceReader](iroh_io::AsyncSliceReader) trait.
 //!
 //! We use [futures_lite] crate, but using the normal futures crate will also work.
@@ -225,8 +225,6 @@ pub use blake3;
 
 #[cfg(all(test, feature = "tokio_fsm"))]
 mod tests;
-#[cfg(all(test, feature = "tokio_fsm"))]
-mod tests2;
 
 /// A set of chunk ranges
 pub type ChunkRanges = range_collections::RangeSet2<ChunkNum>;
@@ -413,9 +411,7 @@ impl BaoTree {
     fn leaf_byte_ranges3(&self, leaf: TreeNode) -> (u64, u64, u64) {
         let Range { start, end } = leaf.byte_range();
         let mid = leaf.mid().to_bytes();
-        if !(start < self.size || (start == 0 && self.size == 0)) {
-            debug_assert!(start < self.size || (start == 0 && self.size == 0));
-        }
+        debug_assert!(start < self.size || (start == 0 && self.size == 0));
         (start, mid.min(self.size), end.min(self.size))
     }
 
@@ -456,26 +452,10 @@ impl BaoTree {
         PreOrderNodeIter::new(root, len).map(move |x| x.subtract_block_size(shift))
     }
 
-    /// Traverse the part of the tree that is relevant for a ranges querys
-    /// in pre order as [NodeInfo]s
-    ///
-    /// This is mostly used internally.
-    ///
-    /// When `min_level` is set to a value greater than 0, the iterator will
-    /// skip all branch nodes that are at a level < min_level if they are fully
-    /// covered by the ranges.
-    #[cfg(test)]
-    pub fn ranges_pre_order_nodes_iter<'a>(
-        &self,
-        ranges: &'a RangeSetRef<ChunkNum>,
-        min_level: u8,
-    ) -> PreOrderPartialIterRef<'a> {
-        PreOrderPartialIterRef::new(*self, ranges, min_level)
-    }
-
     /// Root of the tree
     ///
     /// Does not consider block size
+    #[deprecated(note = "does not consider the block size of the tree")]
     pub fn root(&self) -> TreeNode {
         let shift = 10;
         let mask = (1 << shift) - 1;
@@ -512,30 +492,11 @@ impl BaoTree {
         self.outboard_hash_pairs() * 64
     }
 
-    #[allow(dead_code)]
+    #[cfg(all(test, feature = "tokio_fsm"))]
     fn filled_size(&self) -> TreeNode {
         let blocks = self.chunks();
         let n = blocks.0.div_ceil(2);
         TreeNode(n + n.saturating_sub(1))
-    }
-
-    /// true if the node is a leaf for this tree
-    ///
-    /// If a tree has a non-zero block size, this is different than the node
-    /// being a leaf (level=0).
-    #[cfg(test)]
-    const fn is_leaf(&self, node: TreeNode) -> bool {
-        node.level() == self.block_size.to_u32()
-    }
-
-    /// true if the given node is persisted
-    ///
-    /// the only node that is not persisted is the last leaf node, if it is
-    /// less than half full
-    #[inline]
-    #[cfg(test)]
-    const fn is_persisted(&self, node: TreeNode) -> bool {
-        !self.is_leaf(node) || node.mid().to_bytes() < self.size
     }
 
     /// true if this is a node that is relevant for the outboard
@@ -641,9 +602,9 @@ impl TreeNode {
     /// So for level 0, the start chunk must even. For level 1, the start chunk
     /// must be divisible by 4, etc.
     ///
-    /// This is a bridge from the recursive reference implementation to the node
-    /// based implementations, and is therefore only used in tests.
-    #[cfg(all(test, feature = "tokio_fsm"))]
+    /// This is a bridge from the recursive implementations to the node based
+    /// implementations. It is used in tests and in the mixed traversal.
+    #[cfg(any(all(test, feature = "tokio_fsm"), feature = "experimental-mixed"))]
     fn from_start_chunk_and_level(start_chunk: ChunkNum, level: BlockSize) -> Self {
         let start_chunk = start_chunk.0;
         let level = level.0;
@@ -741,13 +702,13 @@ impl TreeNode {
         self.next_left_ancestor0().map(Self)
     }
 
-    /// Get the left child of this node, or None if it is a child node.
+    /// Get the left child of this node, or None if it is a leaf node.
     pub fn left_child(&self) -> Option<Self> {
         let offset = 1 << self.level().checked_sub(1)?;
         Some(Self(self.0 - offset))
     }
 
-    /// Get the right child of this node, or None if it is a child node.
+    /// Get the right child of this node, or None if it is a leaf node.
     pub fn right_child(&self) -> Option<Self> {
         let offset = 1 << self.level().checked_sub(1)?;
         Some(Self(self.0 + offset))
@@ -941,16 +902,108 @@ mod io_error_serde {
     use std::{fmt, io};
 
     use serde::{
-        de::{self, Visitor},
+        de::{self, SeqAccess, Visitor},
+        ser::SerializeTuple,
         Deserializer, Serializer,
     };
+
+    fn error_kind_to_u8(kind: io::ErrorKind) -> u8 {
+        match kind {
+            io::ErrorKind::AddrInUse => 0,
+            io::ErrorKind::AddrNotAvailable => 1,
+            io::ErrorKind::AlreadyExists => 2,
+            io::ErrorKind::ArgumentListTooLong => 3,
+            io::ErrorKind::BrokenPipe => 4,
+            io::ErrorKind::ConnectionAborted => 5,
+            io::ErrorKind::ConnectionRefused => 6,
+            io::ErrorKind::ConnectionReset => 7,
+            io::ErrorKind::CrossesDevices => 8,
+            io::ErrorKind::Deadlock => 9,
+            io::ErrorKind::DirectoryNotEmpty => 10,
+            io::ErrorKind::ExecutableFileBusy => 11,
+            io::ErrorKind::FileTooLarge => 12,
+            io::ErrorKind::HostUnreachable => 13,
+            io::ErrorKind::Interrupted => 14,
+            io::ErrorKind::InvalidData => 15,
+            io::ErrorKind::InvalidInput => 17,
+            io::ErrorKind::IsADirectory => 18,
+            io::ErrorKind::NetworkDown => 19,
+            io::ErrorKind::NetworkUnreachable => 20,
+            io::ErrorKind::NotADirectory => 21,
+            io::ErrorKind::NotConnected => 22,
+            io::ErrorKind::NotFound => 23,
+            io::ErrorKind::NotSeekable => 24,
+            io::ErrorKind::Other => 25,
+            io::ErrorKind::OutOfMemory => 26,
+            io::ErrorKind::PermissionDenied => 27,
+            io::ErrorKind::QuotaExceeded => 28,
+            io::ErrorKind::ReadOnlyFilesystem => 29,
+            io::ErrorKind::ResourceBusy => 30,
+            io::ErrorKind::StaleNetworkFileHandle => 31,
+            io::ErrorKind::StorageFull => 32,
+            io::ErrorKind::TimedOut => 33,
+            io::ErrorKind::TooManyLinks => 34,
+            io::ErrorKind::UnexpectedEof => 35,
+            io::ErrorKind::Unsupported => 36,
+            io::ErrorKind::WouldBlock => 37,
+            io::ErrorKind::WriteZero => 38,
+            _ => 25,
+        }
+    }
+
+    fn u8_to_error_kind(num: u8) -> io::ErrorKind {
+        match num {
+            0 => io::ErrorKind::AddrInUse,
+            1 => io::ErrorKind::AddrNotAvailable,
+            2 => io::ErrorKind::AlreadyExists,
+            3 => io::ErrorKind::ArgumentListTooLong,
+            4 => io::ErrorKind::BrokenPipe,
+            5 => io::ErrorKind::ConnectionAborted,
+            6 => io::ErrorKind::ConnectionRefused,
+            7 => io::ErrorKind::ConnectionReset,
+            8 => io::ErrorKind::CrossesDevices,
+            9 => io::ErrorKind::Deadlock,
+            10 => io::ErrorKind::DirectoryNotEmpty,
+            11 => io::ErrorKind::ExecutableFileBusy,
+            12 => io::ErrorKind::FileTooLarge,
+            13 => io::ErrorKind::HostUnreachable,
+            14 => io::ErrorKind::Interrupted,
+            15 => io::ErrorKind::InvalidData,
+            // 16 => io::ErrorKind::InvalidFilename,
+            17 => io::ErrorKind::InvalidInput,
+            18 => io::ErrorKind::IsADirectory,
+            19 => io::ErrorKind::NetworkDown,
+            20 => io::ErrorKind::NetworkUnreachable,
+            21 => io::ErrorKind::NotADirectory,
+            22 => io::ErrorKind::NotConnected,
+            23 => io::ErrorKind::NotFound,
+            24 => io::ErrorKind::NotSeekable,
+            25 => io::ErrorKind::Other,
+            26 => io::ErrorKind::OutOfMemory,
+            27 => io::ErrorKind::PermissionDenied,
+            28 => io::ErrorKind::QuotaExceeded,
+            29 => io::ErrorKind::ReadOnlyFilesystem,
+            30 => io::ErrorKind::ResourceBusy,
+            31 => io::ErrorKind::StaleNetworkFileHandle,
+            32 => io::ErrorKind::StorageFull,
+            33 => io::ErrorKind::TimedOut,
+            34 => io::ErrorKind::TooManyLinks,
+            35 => io::ErrorKind::UnexpectedEof,
+            36 => io::ErrorKind::Unsupported,
+            37 => io::ErrorKind::WouldBlock,
+            38 => io::ErrorKind::WriteZero,
+            _ => io::ErrorKind::Other,
+        }
+    }
 
     pub fn serialize<S>(error: &io::Error, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        // Serialize the error kind and message
-        serializer.serialize_str(&format!("{:?}:{}", error.kind(), error))
+        let mut tup = serializer.serialize_tuple(2)?;
+        tup.serialize_element(&error_kind_to_u8(error.kind()))?;
+        tup.serialize_element(&error.to_string())?;
+        tup.end()
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<io::Error, D::Error>
@@ -959,23 +1012,28 @@ mod io_error_serde {
     {
         struct IoErrorVisitor;
 
-        impl Visitor<'_> for IoErrorVisitor {
+        impl<'de> Visitor<'de> for IoErrorVisitor {
             type Value = io::Error;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("an io::Error string representation")
+                formatter.write_str("a tuple of (u8, String) representing io::Error")
             }
 
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
-                E: de::Error,
+                A: SeqAccess<'de>,
             {
-                // For simplicity, create a generic error
-                // In a real app, you might want to parse the kind from the string
-                Ok(io::Error::other(value))
+                let num: u8 = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let message: String = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                let kind = u8_to_error_kind(num);
+                Ok(io::Error::new(kind, message))
             }
         }
 
-        deserializer.deserialize_str(IoErrorVisitor)
+        deserializer.deserialize_tuple(2, IoErrorVisitor)
     }
 }

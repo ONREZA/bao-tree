@@ -1,6 +1,6 @@
 //! Errors when encoding or decoding
 //!
-//! These erros contain more specific information about e.g. where a hash mismatch occured
+//! These errors contain more specific information about e.g. where a hash mismatch occurred
 use std::{fmt, io};
 
 use crate::{ChunkNum, TreeNode};
@@ -161,7 +161,13 @@ impl From<io::Error> for EncodeError {
 }
 
 impl EncodeError {
-    #[cfg(feature = "tokio_fsm")]
+    pub(crate) fn missing_hash_pair(node: TreeNode) -> Self {
+        Self::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("outboard returned no hash pair for node {node}"),
+        ))
+    }
+
     pub(crate) fn maybe_parent_write(e: io::Error, node: TreeNode) -> Self {
         if e.kind() == io::ErrorKind::ConnectionReset {
             Self::ParentWrite(node)
@@ -170,7 +176,6 @@ impl EncodeError {
         }
     }
 
-    #[cfg(feature = "tokio_fsm")]
     pub(crate) fn maybe_leaf_write(e: io::Error, chunk: ChunkNum) -> Self {
         if e.kind() == io::ErrorKind::ConnectionReset {
             Self::LeafWrite(chunk)

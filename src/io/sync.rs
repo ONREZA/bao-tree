@@ -48,6 +48,17 @@ pub trait Outboard {
     /// The tree. This contains the information about the size of the file and the block size.
     fn tree(&self) -> BaoTree;
     /// load the hash pair for a node
+    ///
+    /// Return `Ok(None)` only for nodes that are not stored in this outboard by
+    /// design. Usually these are the nodes inside a chunk group, where
+    /// [BaoTree::pre_order_offset] or [BaoTree::post_order_offset] return `None`,
+    /// but an outboard may also store some of them, e.g. to be able to serve
+    /// parts of a chunk group.
+    ///
+    /// For a node whose hash pair is not available yet, such as an unwritten
+    /// region of a sparse file, return a pair of zero hashes. These never
+    /// verify, so the node is treated like corrupted data. Return an error only
+    /// for io failures.
     fn load(&self, node: TreeNode) -> io::Result<Option<(blake3::Hash, blake3::Hash)>>;
 }
 
@@ -61,6 +72,9 @@ pub trait Outboard {
 /// implementation [super::outboard::EmptyOutboard].
 pub trait OutboardMut: Sized {
     /// Save a hash pair for a node
+    ///
+    /// Nodes that are not stored in this outboard by design, i.e. where
+    /// [Outboard::load] returns `Ok(None)`, must be accepted and ignored.
     fn save(&mut self, node: TreeNode, hash_pair: &(blake3::Hash, blake3::Hash)) -> io::Result<()>;
 
     /// Sync the outboard.
@@ -94,7 +108,7 @@ pub trait CreateOutboard {
     /// So this can be used to initialize an outboard that does not have a default,
     /// such as a file based one.
     ///
-    /// It will only include data up the the current tree size.
+    /// It will only include data up to the current tree size.
     fn init_from(&mut self, data: impl Read) -> io::Result<()>;
 }
 
@@ -146,9 +160,7 @@ impl<R: ReadAt> Outboard for PreOrderOutboard<R> {
             return Ok(None);
         };
         let offset = offset * 64;
-        let mut content = [0u8; 64];
-        self.data.read_exact_at(offset, &mut content)?;
-        Ok(Some(parse_hash_pair(content)))
+        read_hash_pair(&self.data, offset).map(Some)
     }
 }
 
@@ -250,13 +262,23 @@ impl<R: ReadAt> Outboard for PostOrderOutboard<R> {
             return Ok(None);
         };
         let offset = offset.value() * 64;
-        let mut content = [0u8; 64];
-        self.data.read_exact_at(offset, &mut content)?;
-        Ok(Some(parse_hash_pair(content)))
+        read_hash_pair(&self.data, offset).map(Some)
+    }
+}
+
+/// Read a hash pair, returning zero hashes if the data ends before the pair.
+fn read_hash_pair(data: &impl ReadAt, offset: u64) -> io::Result<(blake3::Hash, blake3::Hash)> {
+    let mut content = [0u8; 64];
+    match data.read_exact_at(offset, &mut content) {
+        Ok(()) => Ok(parse_hash_pair(content)),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(parse_hash_pair([0u8; 64])),
+        Err(e) => Err(e),
     }
 }
 
 /// Iterator that can be used to decode a response to a range request.
+///
+/// The iterator ends after the first error.
 ///
 /// Keyed callers should use [Self::new_keyed].
 #[derive(Debug)]
@@ -343,14 +365,15 @@ impl<'a, R: Read> DecodeResponseIter<'a, R> {
         &self.buf
     }
 
-    /// Get a reference to the tree used for decoding.
-    ///
-    /// This is only available after the first chunk has been decoded.
+    /// Get the tree used for decoding.
     pub fn tree(&self) -> BaoTree {
         self.inner.tree()
     }
 
     fn next0(&mut self) -> result::Result<Option<BaoContentItem>, DecodeError> {
+        if self.stack.is_empty() {
+            return Ok(None);
+        }
         match self.inner.next() {
             Some(BaoChunk::Parent {
                 is_root,
@@ -406,7 +429,11 @@ impl<R: Read> Iterator for DecodeResponseIter<'_, R> {
     type Item = result::Result<BaoContentItem, DecodeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next0().transpose()
+        let res = self.next0();
+        if res.is_err() {
+            self.stack.clear();
+        }
+        res.transpose()
     }
 }
 
@@ -456,9 +483,13 @@ fn encode_ranges_impl<D: ReadAt + Size, O: Outboard, W: Write>(
     for item in tree.ranges_pre_order_chunks_iter_ref(ranges, 0) {
         match item {
             BaoChunk::Parent { node, .. } => {
-                let (l_hash, r_hash) = outboard.load(node)?.unwrap();
+                let (l_hash, r_hash) = outboard
+                    .load(node)?
+                    .ok_or_else(|| EncodeError::missing_hash_pair(node))?;
                 let pair = combine_hash_pair(&l_hash, &r_hash);
-                encoded.write_all(&pair)?;
+                encoded
+                    .write_all(&pair)
+                    .map_err(|e| EncodeError::maybe_parent_write(e, node))?;
             }
             BaoChunk::Leaf {
                 start_chunk,
@@ -481,9 +512,13 @@ fn encode_ranges_impl<D: ReadAt + Size, O: Outboard, W: Write>(
                         &mut out_buf,
                         mode,
                     );
-                    encoded.write_all(&out_buf)?;
+                    encoded
+                        .write_all(&out_buf)
+                        .map_err(|e| EncodeError::maybe_leaf_write(e, start_chunk))?;
                 } else {
-                    encoded.write_all(buf)?;
+                    encoded
+                        .write_all(buf)
+                        .map_err(|e| EncodeError::maybe_leaf_write(e, start_chunk))?;
                 }
             }
         }
@@ -543,7 +578,9 @@ fn encode_ranges_validated_impl<D: ReadAt, O: Outboard, W: Write>(
                 node,
                 ..
             } => {
-                let (l_hash, r_hash) = outboard.load(node)?.unwrap();
+                let (l_hash, r_hash) = outboard
+                    .load(node)?
+                    .ok_or_else(|| EncodeError::missing_hash_pair(node))?;
                 let actual = mode.parent_cv(&l_hash, &r_hash, is_root);
                 let expected = stack.pop().unwrap();
                 if actual != expected {
@@ -556,7 +593,9 @@ fn encode_ranges_validated_impl<D: ReadAt, O: Outboard, W: Write>(
                     stack.push(l_hash);
                 }
                 let pair = combine_hash_pair(&l_hash, &r_hash);
-                encoded.write_all(&pair)?;
+                encoded
+                    .write_all(&pair)
+                    .map_err(|e| EncodeError::maybe_parent_write(e, node))?;
             }
             BaoChunk::Leaf {
                 start_chunk,
@@ -594,7 +633,9 @@ fn encode_ranges_validated_impl<D: ReadAt, O: Outboard, W: Write>(
                 if actual != expected {
                     return Err(EncodeError::LeafHashMismatch(start_chunk));
                 }
-                encoded.write_all(to_write)?;
+                encoded
+                    .write_all(to_write)
+                    .map_err(|e| EncodeError::maybe_leaf_write(e, start_chunk))?;
             }
         }
     }
@@ -914,12 +955,19 @@ mod validate {
             co: &Co<io::Result<Range<ChunkNum>>>,
             mode: HashMode,
         ) -> io::Result<()> {
+            if ranges.is_empty() {
+                return Ok(());
+            }
             let tree = outboard.tree();
             let mut buffer = vec![0u8; tree.chunk_group_bytes()];
             if tree.blocks() == 1 {
                 // special case for a tree that fits in one block / chunk group
                 let tmp = &mut buffer[..tree.size().try_into().unwrap()];
-                data.read_exact_at(0, tmp)?;
+                match data.read_exact_at(0, tmp) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                    Err(e) => return Err(e),
+                }
                 let actual = mode.hash_subtree(0, tmp, true);
                 if actual == outboard.root() {
                     co.yield_(Ok(ChunkNum(0)..tree.chunks())).await;
@@ -951,7 +999,11 @@ mod validate {
         ) -> io::Result<()> {
             let len = (range.end - range.start).try_into().unwrap();
             let tmp = &mut self.buffer[..len];
-            self.data.read_exact_at(range.start, tmp)?;
+            match self.data.read_exact_at(range.start, tmp) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e),
+            }
             // is_root is always false because the case of a single chunk group is handled before calling this function
             let actual = self
                 .mode
@@ -986,7 +1038,7 @@ mod validate {
                     return Ok(());
                 }
                 let Some((l_hash, r_hash)) = self.outboard.load(node)? else {
-                    // outboard is incomplete, we can't validate
+                    // node is not stored in the outboard, we can't validate
                     return Ok(());
                 };
                 let actual = self.mode.parent_cv(&l_hash, &r_hash, is_root);
@@ -1073,6 +1125,9 @@ mod validate {
             co: &Co<io::Result<Range<ChunkNum>>>,
             mode: HashMode,
         ) -> io::Result<()> {
+            if ranges.is_empty() {
+                return Ok(());
+            }
             let tree = outboard.tree();
             if tree.blocks() == 1 {
                 // special case for a tree that fits in one block / chunk group
@@ -1118,7 +1173,7 @@ mod validate {
                     return Ok(());
                 }
                 let Some((l_hash, r_hash)) = self.outboard.load(node)? else {
-                    // outboard is incomplete, we can't validate
+                    // node is not stored in the outboard, we can't validate
                     return Ok(());
                 };
                 let actual = self.mode.parent_cv(&l_hash, &r_hash, is_root);

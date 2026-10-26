@@ -32,7 +32,7 @@ mod serde_support {
     impl Serialize for Parent {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             let (l, r) = self.pair;
-            let mut seq = serializer.serialize_seq(Some(2))?;
+            let mut seq = serializer.serialize_seq(Some(3))?;
             seq.serialize_element(&self.node)?;
             seq.serialize_element(l.as_bytes())?;
             seq.serialize_element(r.as_bytes())?;
@@ -170,7 +170,8 @@ pub fn round_up_to_chunks_groups(ranges: ChunkRanges, chunk_size: BlockSize) -> 
     res
 }
 
-/// Given a range set of byte ranges, round it up to chunk groups.
+/// Given a range set of chunk ranges, keep only the chunk groups that are
+/// completely covered.
 ///
 /// If we store outboard data at a level of granularity of `block_size`, we can only
 /// share full chunk groups because we don't have proofs for anything below a chunk group.
@@ -179,21 +180,23 @@ pub fn full_chunk_groups(ranges: &ChunkRanges, block_size: BlockSize) -> ChunkRa
         value >> shift << shift
     }
 
-    fn ceil(value: u64, shift: u8) -> u64 {
-        (value + (1 << shift) - 1) >> shift << shift
+    fn ceil(value: u64, shift: u8) -> Option<u64> {
+        value.checked_next_multiple_of(1 << shift)
     }
     let mut res = ChunkRanges::empty();
     for item in ranges.iter() {
         match item {
             RangeSetRange::RangeFrom(range) => {
-                let start = ceil(range.start.0, block_size.0);
-                res |= ChunkRanges::from(ChunkNum(start)..)
+                if let Some(start) = ceil(range.start.0, block_size.0) {
+                    res |= ChunkRanges::from(ChunkNum(start)..)
+                }
             }
             RangeSetRange::Range(range) => {
-                let start = ceil(range.start.0, block_size.0);
                 let end = floor(range.end.0, block_size.0);
-                if start < end {
-                    res |= ChunkRanges::from(ChunkNum(start)..ChunkNum(end))
+                if let Some(start) = ceil(range.start.0, block_size.0) {
+                    if start < end {
+                        res |= ChunkRanges::from(ChunkNum(start)..ChunkNum(end))
+                    }
                 }
             }
         }
@@ -216,7 +219,8 @@ pub(crate) type LocalBoxFuture<'a, T> =
 
 #[cfg(test)]
 mod tests {
-    use crate::{BlockSize, ChunkNum};
+    use super::{full_chunk_groups, round_up_to_chunks_groups};
+    use crate::{BlockSize, ChunkNum, ChunkRanges};
 
     #[test]
     fn test_chunk_group_start() {
@@ -228,5 +232,33 @@ mod tests {
         assert_eq!(ChunkNum::chunk_group_end(ChunkNum(1), bs), ChunkNum(16));
         assert_eq!(ChunkNum::chunk_group_end(ChunkNum(16), bs), ChunkNum(16));
         assert_eq!(ChunkNum::chunk_group_end(ChunkNum(17), bs), ChunkNum(32));
+        assert_eq!(
+            ChunkNum::chunk_group_end(ChunkNum(u64::MAX - 1), bs),
+            ChunkNum(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn test_chunk_groups_near_max() {
+        let bs = BlockSize(4);
+        let max = u64::MAX;
+        let cr = |start: u64, end: u64| ChunkRanges::from(ChunkNum(start)..ChunkNum(end));
+        let from = |start: u64| ChunkRanges::from(ChunkNum(start)..);
+        assert_eq!(full_chunk_groups(&from(max - 1), bs), ChunkRanges::empty());
+        assert_eq!(full_chunk_groups(&cr(5, max - 1), bs), cr(16, max - 15));
+        assert_eq!(
+            full_chunk_groups(&cr(max - 1, max), bs),
+            ChunkRanges::empty()
+        );
+        assert_eq!(
+            full_chunk_groups(&cr(max - 20, max - 1), bs),
+            ChunkRanges::empty()
+        );
+        assert_eq!(round_up_to_chunks_groups(from(max - 1), bs), from(max - 15));
+        assert_eq!(round_up_to_chunks_groups(cr(5, max - 1), bs), cr(0, max));
+        assert_eq!(
+            round_up_to_chunks_groups(cr(max - 20, max - 1), bs),
+            cr(max - 31, max)
+        );
     }
 }
